@@ -2,8 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-from data import labels, extract_features, KWSDataset
+from data import make_dataset, extract_features
 
 
 class CTCModel(nn.Module):
@@ -13,6 +14,8 @@ class CTCModel(nn.Module):
         self.fc = nn.Linear(hidden_dim * 2, output_dim)  # 因为是双向LSTM
 
     def forward(self, x):
+        # x: (batch, num_mels, input_seq_len)
+        x = x.transpose(1, 2)  # (batch, input_seq_len, num_mels)
         x, _ = self.rnn(x)
         x = self.fc(x)
         return x
@@ -33,37 +36,33 @@ def add_noise(waveform, noise_factor=0.005):
     return augmented_waveform
 
 
-def train(model, optimizer, dataloader, num_epochs):
+def train(model, optimizer, dataloader, loss_fn, num_epochs):
     model.train()
-
-    # CTC Loss
-    ctc_loss = nn.CTCLoss(blank=0)
 
     for epoch in range(num_epochs):
         total_loss = 0
-        for batch in dataloader:
+        for batch in tqdm(dataloader, f"Training epoch {epoch}/{num_epochs}"):
             inputs, targets, input_lengths, target_lengths = batch
-
+            # print(input_lengths)
             optimizer.zero_grad()
             outputs = model(inputs)
 
             # 转换为log_probs以计算CTC损失
             log_probs = F.log_softmax(outputs, dim=2)
-
-            loss = ctc_loss(log_probs, targets, input_lengths, target_lengths)
+            log_probs = log_probs.transpose(0, 1)
+            # compute CTC loss
+            loss = loss_fn(log_probs, targets, input_lengths, target_lengths)
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
 
         print(f"Epoch {epoch + 1}, Loss: {total_loss / len(dataloader)}")
+        torch.save(model.state_dict(), "./models/model.pt")
 
 
-def evaluate(model, dataloader):
+def evaluate(model, dataloader, loss_fn):
     model.eval()
-
-    # CTC Loss
-    ctc_loss = nn.CTCLoss(blank=0)
 
     total_loss = 0
     with torch.no_grad():
@@ -71,7 +70,8 @@ def evaluate(model, dataloader):
             inputs, targets, input_lengths, target_lengths = batch
             outputs = model(inputs)
             log_probs = F.log_softmax(outputs, dim=2)
-            loss = ctc_loss(log_probs, targets, input_lengths, target_lengths)
+            log_probs = log_probs.transpose(0, 1)
+            loss = loss_fn(log_probs, targets, input_lengths, target_lengths)
             total_loss += loss.item()
 
     print(f"Validation Loss: {total_loss / len(dataloader)}")
@@ -79,21 +79,28 @@ def evaluate(model, dataloader):
 
 if __name__ == "__main__":
     # =============== Model Params ================
-    input_dim = 128  # 梅尔频谱图的频带数量
+    input_dim = 80  # 梅尔频谱图的频带数量, num_mels
     hidden_dim = 256
-    output_dim = len(labels) + 1  # 包含所有可能的标签和一个空白标签
+    output_dim = 5  # 包含所有可能的标签和一个空白标签
 
     model = CTCModel(input_dim, hidden_dim, output_dim)
+    try: model.load_state_dict(torch.load("./models/model.pt"))
+    except: pass
+
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)  # Optimizer
+    # CTC Loss
+    ctc_loss = nn.CTCLoss(blank=0)
+    # log_probs: [seq_len, batch_size, num_classes]
+    # targets: [batch_size, padded_length]
+    # input_lengths: sequence of len(input seqs)
+    # target_lengths: sequence of len(target seqs)
 
-    # 示例数据
-    file_paths = ['path/to/audio1.wav', 'path/to/audio2.wav']
-    labels = ['原神启动', '原神启动']
-    label_map = {'<blank>': 0, '原': 1, '神': 2, '启': 3, '动': 4}
+    label_map = {" ": 0, "原": 1, "神": 2, "启": 3, "动": 4}
+    dataset = make_dataset("./data", "原神启动", label_map=label_map, transform=extract_features)
+    features, labels, input_length, target_length = dataset[0]
 
-    dataset = KWSDataset(file_paths, labels, label_map, transform=extract_features)
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=collate_fn)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_fn)
 
-    train(model, optimizer, dataloader, num_epochs=10)
-
-    # evaluate(model, validation_dataloader)
+    train(model, optimizer, dataloader, ctc_loss, num_epochs=10)
+    torch.save(model.state_dict(), "./models/model.pt")
+    evaluate(model, dataloader, ctc_loss)
